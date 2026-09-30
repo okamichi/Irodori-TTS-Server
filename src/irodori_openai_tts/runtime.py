@@ -45,7 +45,7 @@ class RuntimeManager:
                 t0 = time.perf_counter()
                 self._checkpoint_path = self._resolve_checkpoint_path()
                 logger.info("checkpoint resolved: %s", self._checkpoint_path)
-                self._runtime = InferenceRuntime.from_key(
+                runtime = InferenceRuntime.from_key(
                     RuntimeKey(
                         checkpoint=self._checkpoint_path,
                         model_device=self._resolve_device(self.settings.model_device),
@@ -59,6 +59,26 @@ class RuntimeManager:
                         compile_dynamic=bool(self.settings.compile_dynamic),
                     )
                 )
+                try:
+                    if self.settings.inference_backend == "mlx":
+                        from .mlx_backend import install_mlx_backend
+
+                        install_mlx_backend(runtime, dit_precision=self.settings.mlx_dit_precision)
+                    if (
+                        self.settings.reference_cache_entries
+                        and self.settings.reference_cache_max_mb
+                    ):
+                        from .reference_cache import install_reference_cache
+
+                        install_reference_cache(
+                            runtime,
+                            entries=self.settings.reference_cache_entries,
+                            max_mb=self.settings.reference_cache_max_mb,
+                        )
+                except Exception:
+                    self._runtime = None
+                    raise
+                self._runtime = runtime
                 elapsed = time.perf_counter() - t0
                 logger.info("runtime loaded in %.2fs", elapsed)
             return self._runtime

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -33,6 +34,11 @@ class Settings(BaseSettings):
     compile_model: bool = False
     compile_dynamic: bool = False
     preload: bool = False
+    inference_backend: Literal["torch", "mlx"] = "torch"
+    mlx_dit_precision: Literal["fp32", "fp16"] = "fp32"
+    reference_cache_entries: int = Field(default=8, ge=0)
+    reference_cache_max_mb: int = Field(default=256, ge=0)
+    stream_prefetch_chunks: int = Field(default=1, ge=0, le=4)
     model_load_timeout: float = 300.0
     max_concurrent_synthesis: int = 1
     synthesis_wait_timeout: float = 300.0

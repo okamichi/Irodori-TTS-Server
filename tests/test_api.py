@@ -815,6 +815,56 @@ def test_speech_chunking_can_be_disabled_per_request(monkeypatch):
     assert runtime.texts == [text]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("seed", [None, 19])
+def test_no_reference_does_not_auto_split_voice_between_sentences(monkeypatch, stream, seed):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", 1)
+    text = "こんにちは。MLX版の音声合成をテストしています。"
+    payload = {
+        "model": "irodori-tts",
+        "input": text,
+        "voice": "none",
+        "response_format": "wav",
+        "irodori": {"caption": "落ち着いた自然な女性の声。", "seed": seed},
+    }
+    if stream:
+        payload["stream_format"] = "sse"
+    response = TestClient(main.app).post("/v1/audio/speech", json=payload)
+    assert response.status_code == 200
+    assert runtime.texts == [text]
+    if stream:
+        events = sse_events(response.text)
+        assert [event for event, _ in events] == ["audio_chunk", "done"]
+        assert events[-1][1] == {"chunks": 1}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("seed", [None, 987])
+def test_reference_auto_chunks_reuse_one_seed(tmp_path, monkeypatch, stream, seed):
+    runtime = FakeRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    monkeypatch.setattr(main.settings, "default_first_sentence_chunk_min_chars", 1)
+    ref = tmp_path / "speaker.wav"
+    ref.write_bytes(b"fake reference for request construction")
+    payload = {
+        "model": "irodori-tts",
+        "input": "こんにちは。MLX版の音声合成をテストしています。",
+        "irodori": {"ref_wav": str(ref), "seed": seed},
+    }
+    if stream:
+        payload["stream_format"] = "sse"
+    response = TestClient(main.app).post("/v1/audio/speech", json=payload)
+    assert response.status_code == 200
+    assert runtime.texts == ["こんにちは。", "MLX版の音声合成をテストしています。"]
+    assert runtime.requests[0].seed == seed
+    assert runtime.requests[1].seed == (123 if seed is None else seed)
+    assert all(req.ref_wav == str(ref) and not req.no_ref for req in runtime.requests)
+    if stream:
+        assert sse_events(response.text)[-1][1] == {"chunks": 2}
+
+
 def test_speech_chunking_splits_only_after_min_chars(monkeypatch):
     runtime = FakeRuntime()
     monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
@@ -1094,3 +1144,49 @@ def test_openai_speed_maps_to_inverse_duration_scale():
     request = main._build_sampling_request(payload, voice)
 
     assert request.duration_scale == 0.8
+
+
+def test_stream_prefetch_continues_when_consumer_pauses():
+    async def run_test():
+        second = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def source():
+            try:
+                yield "first"
+                second.set()
+                yield "second"
+                yield "third"
+            finally:
+                closed.set()
+
+        stream = main._prefetch_stream(source(), 1)
+        assert await stream.__anext__() == "first"
+        await asyncio.wait_for(second.wait(), timeout=1)
+        assert await stream.__anext__() == "second"
+        await stream.aclose()
+        assert closed.is_set()
+
+    asyncio.run(run_test())
+
+
+def test_stream_prefetch_stops_its_producer_on_disconnect():
+    async def run_test():
+        started = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def source():
+            try:
+                yield "first"
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+        stream = main._prefetch_stream(source(), 1)
+        assert await stream.__anext__() == "first"
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(stream.aclose(), timeout=1)
+        assert closed.is_set()
+
+    asyncio.run(run_test())

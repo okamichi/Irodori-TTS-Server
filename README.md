@@ -62,6 +62,89 @@ By default, the server downloads [`Aratako/Irodori-TTS-v4-Small`](https://huggin
 IRODORI_CHECKPOINT=/path/to/model.safetensors
 ```
 
+### Apple Silicon: hybrid MLX inference
+
+Install `uv sync --extra mlx` and set the following in `.env` to use a local
+v4-Large checkpoint:
+
+```bash
+IRODORI_INFERENCE_BACKEND=mlx
+IRODORI_MLX_DIT_PRECISION=fp16
+IRODORI_CHECKPOINT=../Irodori-TTS-v4-Large/model.safetensors
+IRODORI_MODEL_DEVICE=mps
+IRODORI_CODEC_DEVICE=mps
+IRODORI_COMPILE_MODEL=false
+IRODORI_DEFAULT_FIRST_SENTENCE_CHUNK_MIN_CHARS=1
+```
+
+The backend reuses [mlx-audio 0.5.4's Irodori DiT blocks](https://github.com/Blaizzy/mlx-audio/tree/main/mlx_audio/tts/models/irodori_tts).
+It converts the existing weights in memory, runs the DiT sampling loop and
+DACVAE encode/decode in MLX, and keeps text/caption encoding and duration
+prediction in PyTorch. This supports the Large checkpoint's T5Gemma encoder
+without substituting the Small checkpoint's ModernBERT encoder. No original
+model files are modified. DiT forward passes use `mx.compile`; the first
+request for a new shape may incur compilation overhead.
+
+Use an unquantized checkpoint with deterministic codec encode/decode.
+Dynamic LoRA is unsupported in this backend; use a merged checkpoint or
+`IRODORI_INFERENCE_BACKEND=torch`. Keep `IRODORI_MODEL_PRECISION=fp32` and
+`IRODORI_CODEC_PRECISION=fp32` on MPS: the upstream loader rejects `bf16` on MPS.
+`IRODORI_MLX_DIT_PRECISION=fp16` independently reduces the large attention/MLP
+weights and matrix multiplications to FP16. AdaLN, normalization, timestep
+conditioning, residuals, attention, CFG and Euler updates stay FP32, as do the
+PyTorch encoders, duration predictor and codec. The default is `fp32`; set it
+explicitly to return to the original full-precision MLX path on restart.
+FP16 introduces rounding differences; compare saved audio for your voices.
+The codec preserves the upstream
+padding, disabled DACVAE watermark branch and separate SilentCipher processing.
+The checkpoint and codec are initially loaded through the existing loader, so
+startup still requires PyTorch and sufficient memory for conversion.
+
+Both backends cache reference latents and encoded speaker states across chunks
+and requests. The shared cache defaults to 8 entries and 256 MiB of CPU memory;
+set `IRODORI_REFERENCE_CACHE_ENTRIES=0` to disable it. File changes, reference
+preprocessing settings and LoRA adapter changes invalidate the relevant entries.
+Stochastic codec encoding bypasses this cache. This saves reference processing;
+it does not skip DiT sampling for new speech.
+
+For early playback, request `stream_format: "sse"` and consume each `audio_chunk`
+as it arrives. `IRODORI_STREAM_PREFETCH_CHUNKS=1` buffers an event while further
+generation proceeds; the producer can also have one synthesis in flight. It
+stops on disconnect, waits for an in-flight synthesis to finish safely, and
+does not run multiple DiT generations concurrently on one runtime. Ordinary
+WAV/MP3 responses still wait for the whole utterance.
+
+An example client plays the first sentence while later chunks are generated:
+
+```bash
+uv run --no-sync python tools/stream_play.py \
+  'こんにちは。これは続きの文章です。最後の文章です。' \
+  --caption '落ち着いた自然な女性の声。'
+```
+
+The client requires `sounddevice` (included in the MLX extra) and `soundfile`.
+Pass `--voice` for a registered reference voice. Set `IRODORI_API_KEY` in the
+client's environment if the server requires authentication.
+
+To compare a local checkpoint and save WAV files plus stage timings:
+
+```bash
+uv run --no-sync python tools/benchmark_backends.py \
+  --checkpoint ../Irodori-TTS-v4-Large/model.safetensors --steps 40 --seconds 2
+IRODORI_TEST_MLX=1 uv run --no-sync pytest tests/test_mlx_backend.py -q
+```
+
+The benchmark compares cold/warm Torch and MLX runs with identical precision,
+seed, steps and duration, and exercises reference normalization, automatic
+duration prediction and speaker-state reuse. MLX speedups depend on workload;
+chunk streaming reduces time until playback begins only when the client plays
+chunks incrementally.
+
+Add `--compare-mlx-precisions` to measure FP32 and mixed FP16 MLX sequentially
+with the same loaded checkpoint, or `--mlx-precision fp16` for FP16 alone.
+The comparison saves both WAV outputs, timing, DiT weight sizes and numerical
+audio differences; numerical similarity does not establish perceived quality.
+
 `IRODORI_HF_CHECKPOINT` also accepts a checkpoint subfolder inside a Hugging Face repo:
 
 ```bash
@@ -293,6 +376,11 @@ event per chunk, followed by a final `done` event:
 For consistent voice tone across chunks, specify a reference voice with `voice`,
 `irodori.ref_wav`, or `irodori.ref_wavs`. Without a reference, each chunk is synthesized
 independently and the perceived voice tone may vary between chunks.
+For this reason, `voice: "none"` is generated as one utterance by default, even
+when the server enables chunking. Explicit `irodori.chunking_enabled: true`
+opts into independent chunks and possible voice changes. A fixed seed alone
+does not fix the speaker when text and duration change. When seed is omitted,
+later chunks reuse the first chunk's selected seed within the request.
 
 ```bash
 curl -N http://localhost:8088/v1/audio/speech \
@@ -505,7 +593,10 @@ for older checkpoints.
 
 ## Long Text Chunking
 
-Long text chunking is enabled by default.
+Long text chunking is enabled by default for reference voices. Without a
+reference, the default is one generation to avoid voice changes at chunk
+boundaries. For long no-reference input, respect the model's text/duration
+limits, or explicitly enable chunking and accept potential voice variation.
 
 When enabled, the server splits text only when both conditions are met:
 
@@ -566,6 +657,11 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_CHECKPOINT` | unset | Local checkpoint path. Takes precedence over `IRODORI_HF_CHECKPOINT`; keep a bundled `tokenizer/` beside the checkpoint or above its variant subfolder. |
 | `IRODORI_CODEC_REPO` | `Aratako/Semantic-DACVAE-Japanese-32dim` | DACVAE codec repo or path. |
 | `IRODORI_MODEL_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
+| `IRODORI_INFERENCE_BACKEND` | `torch` | `torch` or hybrid `mlx` (Apple Silicon). |
+| `IRODORI_MLX_DIT_PRECISION` | `fp32` | MLX only: `fp32` or mixed `fp16` attention/MLP matrix multiplications with FP32 norms/CFG/Euler updates. |
+| `IRODORI_REFERENCE_CACHE_ENTRIES` | `8` | Shared limit for cached reference latent/speaker-state entries; `0` disables. |
+| `IRODORI_REFERENCE_CACHE_MAX_MB` | `256` | Shared CPU-memory cache budget in MiB; `0` disables. |
+| `IRODORI_STREAM_PREFETCH_CHUNKS` | `1` | Buffered SSE events (`0`–`4`); an additional synthesis can be in flight. |
 | `IRODORI_CODEC_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
 | `IRODORI_MODEL_PRECISION` | `fp32` | `fp32` or `bf16`. |
 | `IRODORI_CODEC_PRECISION` | `fp32` | `fp32` or `bf16`. |

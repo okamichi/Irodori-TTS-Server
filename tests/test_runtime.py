@@ -22,6 +22,46 @@ def test_sampling_steps_environment_override(monkeypatch, steps):
     assert Settings(_env_file=None).default_num_steps == steps
 
 
+def test_mlx_precision_is_independent_of_torch_precision(monkeypatch):
+    monkeypatch.setenv("IRODORI_MLX_DIT_PRECISION", "fp16")
+    settings = Settings(model_precision="fp32", codec_precision="fp32", _env_file=None)
+    assert settings.mlx_dit_precision == "fp16"
+    assert settings.model_precision == settings.codec_precision == "fp32"
+    monkeypatch.setenv("IRODORI_MLX_DIT_PRECISION", "int8")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)
+
+
+def test_runtime_passes_mlx_precision_to_installer(tmp_path, monkeypatch):
+    from irodori_openai_tts import mlx_backend
+
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"test")
+    loaded_runtime = object()
+    calls = []
+    monkeypatch.setattr(
+        runtime_module.InferenceRuntime, "from_key", staticmethod(lambda key: loaded_runtime)
+    )
+    monkeypatch.setattr(
+        mlx_backend,
+        "install_mlx_backend",
+        lambda runtime, *, dit_precision: calls.append((runtime, dit_precision)),
+    )
+    manager = RuntimeManager(
+        Settings(
+            checkpoint=str(checkpoint),
+            inference_backend="mlx",
+            mlx_dit_precision="fp16",
+            model_device="cpu",
+            codec_device="cpu",
+            reference_cache_entries=0,
+            _env_file=None,
+        )
+    )
+    assert manager.get() is loaded_runtime
+    assert calls == [(loaded_runtime, "fp16")]
+
+
 def test_runtime_load_timeout_while_another_thread_is_loading(tmp_path, monkeypatch):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"test")
@@ -30,6 +70,7 @@ def test_runtime_load_timeout_while_another_thread_is_loading(tmp_path, monkeypa
         model_device="cpu",
         codec_device="cpu",
         model_load_timeout=0.05,
+        reference_cache_entries=0,
         _env_file=None,
     )
     manager = RuntimeManager(settings)

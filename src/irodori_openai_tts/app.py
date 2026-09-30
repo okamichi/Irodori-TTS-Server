@@ -168,6 +168,8 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "model": {
+            "inference_backend": settings.inference_backend,
+            "mlx_dit_precision": settings.mlx_dit_precision,
             "id": settings.model_name,
             "hf_checkpoint": settings.hf_checkpoint,
             "model_device": settings.model_device,
@@ -548,11 +550,15 @@ def _release_synthesis_slot(semaphore: asyncio.Semaphore) -> None:
 
 
 def _speech_chunks(payload: SpeechRequest, sampling_request: SamplingRequest) -> list[str]:
+    explicit_enabled = _coalesce(
+        payload.irodori.chunking_enabled,
+        _extra(payload, "chunking_enabled"),
+        _extra(payload, "chunking"),
+        None,
+    )
     enabled = bool(
         _coalesce(
-            payload.irodori.chunking_enabled,
-            _extra(payload, "chunking_enabled"),
-            _extra(payload, "chunking"),
+            explicit_enabled,
             settings.default_chunking_enabled,
         )
     )
@@ -587,6 +593,13 @@ def _speech_chunks(payload: SpeechRequest, sampling_request: SamplingRequest) ->
             status_code=400,
             detail="first_sentence_chunk_min_chars must be greater than 0.",
         )
+
+    # A caption and random seed do not identify a speaker. Without a reference,
+    # independently sampled chunks can sound like different people. Prefer one
+    # generation unless the caller explicitly opts into this tradeoff.
+    if sampling_request.no_ref and explicit_enabled is None:
+        logger.info("speech chunking skipped: no reference voice; generate as one utterance")
+        return [payload.input]
 
     chunks = _split_text_for_speech(
         payload.input,
@@ -652,9 +665,10 @@ async def _synthesize_chunks(
         )
 
     results: list[SamplingResult] = []
+    chunk_base_request = sampling_request
     for index, chunk in enumerate(chunks, start=1):
         logger.info("speech chunk %d/%d started: chars=%d", index, len(chunks), len(chunk))
-        chunk_request = replace(sampling_request, text=chunk)
+        chunk_request = replace(chunk_base_request, text=chunk)
         chunk_result = await _run_blocking(
             _synthesize_once,
             runtime,
@@ -667,6 +681,8 @@ async def _synthesize_chunks(
             _audio_duration_seconds(chunk_result.audio, chunk_result.sample_rate),
         )
         results.append(chunk_result)
+        if chunk_base_request.seed is None:
+            chunk_base_request = replace(chunk_base_request, seed=chunk_result.used_seed)
 
     sample_rate = results[0].sample_rate
     if any(result.sample_rate != sample_rate for result in results):
@@ -700,6 +716,7 @@ def _stream_speech_response(
         completed = 0
         try:
             runtime = await _run_blocking(runtime_manager.get)
+            chunk_base_request = sampling_request
             for index, chunk in enumerate(chunks):
                 logger.info(
                     "speech stream chunk %d/%d started: chars=%d",
@@ -707,7 +724,7 @@ def _stream_speech_response(
                     len(chunks),
                     len(chunk),
                 )
-                chunk_request = replace(sampling_request, text=chunk)
+                chunk_request = replace(chunk_base_request, text=chunk)
                 synthesis_semaphore = await _acquire_synthesis_slot()
                 try:
                     result = await _run_stream_blocking(
@@ -717,6 +734,8 @@ def _stream_speech_response(
                     )
                 finally:
                     _release_synthesis_slot(synthesis_semaphore)
+                if chunk_base_request.seed is None:
+                    chunk_base_request = replace(chunk_base_request, seed=result.used_seed)
                 audio_bytes = await _run_stream_blocking(
                     encode_audio,
                     result.audio,
@@ -741,6 +760,7 @@ def _stream_speech_response(
                         "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
                         "seed": result.used_seed,
                         "total_to_decode": result.total_to_decode,
+                        "stage_timings": dict(result.stage_timings),
                     },
                 )
         except RuntimeLoadTimeoutError as exc:
@@ -769,10 +789,44 @@ def _stream_speech_response(
             yield _sse_event("done", {"chunks": completed})
 
     return StreamingResponse(
-        events(),
+        _prefetch_stream(events(), settings.stream_prefetch_chunks)
+        if settings.stream_prefetch_chunks
+        else events(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+async def _prefetch_stream(source: AsyncIterator[str], capacity: int) -> AsyncIterator[str]:
+    """Continue synthesis while the client consumes chunks, with bounded buffering."""
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=capacity)
+    done = object()
+
+    async def produce() -> None:
+        try:
+            async for event in source:
+                await queue.put(event)
+        except Exception as exc:
+            await queue.put(exc)
+        finally:
+            await source.aclose()
+        await queue.put(done)
+
+    producer = asyncio.create_task(produce())
+    try:
+        while True:
+            event = await queue.get()
+            if event is done:
+                break
+            if isinstance(event, Exception):
+                raise event
+            yield event
+    finally:
+        producer.cancel()
+        try:
+            await producer
+        except asyncio.CancelledError:
+            pass
 
 
 async def _run_stream_blocking(func: Any, *args: Any, **kwargs: Any) -> Any:
