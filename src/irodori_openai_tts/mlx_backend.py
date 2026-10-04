@@ -38,16 +38,19 @@ def to_torch(array, *, device, dtype):
 
 
 def set_dit_precision(dit, precision):
-    """Configure before compilation; FP16 GEMMs return to FP32 at each boundary.
+    """Configure before compilation; reduced-precision GEMMs return to FP32.
 
     Changing FP16 back to FP32 cannot restore rounded weights. Reload the
     checkpoint for a full-precision baseline, and recompile after any change.
+    Packed INT8 weights cannot be reconfigured without reloading the checkpoint.
     """
     import mlx.core as mx
     import mlx.nn as nn
 
-    if precision not in {"fp32", "fp16"}:
-        raise ValueError("MLX DiT precision must be fp32 or fp16.")
+    if precision not in {"fp32", "fp16", "int8"}:
+        raise ValueError("MLX DiT precision must be fp32, fp16 or int8.")
+    if any(isinstance(module, nn.QuantizedLinear) for _, module in dit.named_modules()):
+        raise ValueError("Reload the checkpoint before changing a quantized DiT's precision.")
 
     class MatmulLinear(nn.Linear):
         def __init__(self, source):
@@ -60,16 +63,43 @@ def set_dit_precision(dit, precision):
         def __call__(self, x):
             return super().__call__(x.astype(self.weight.dtype)).astype(mx.float32)
 
+    class INT8Linear(nn.QuantizedLinear):
+        def __init__(self, source):
+            nn.Module.__init__(self)
+            self.group_size = 64
+            self.bits = 8
+            self.mode = "affine"
+            # Quantize original FP32 values, then store small scale/offset tables
+            # in FP16. Weights stay packed during inference; no full dequantize.
+            self.weight, scales, biases = mx.quantize(
+                source.weight, group_size=self.group_size, bits=self.bits, mode=self.mode
+            )
+            self.scales = scales.astype(mx.float16)
+            self.biases = biases.astype(mx.float16)
+            if "bias" in source:
+                self.bias = source.bias
+            self.freeze()
+
+        def __call__(self, x):
+            return super().__call__(x.astype(mx.float16)).astype(mx.float32)
+
     # Keep AdaLN, timestep conditioning, norms and small input/output projectors
     # in FP32. Only the large attention/MLP matrices use reduced precision.
     dit.apply(lambda value: value.astype(mx.float32))
     for block in dit.blocks:
         for module in (block.attention, block.mlp):
-            replacements = {
-                name: MatmulLinear(child)
-                for name, child in module.children().items()
-                if isinstance(child, nn.Linear)
-            }
+            replacements = {}
+            for name, child in module.children().items():
+                if not isinstance(child, nn.Linear):
+                    continue
+                # MLX affine groups must divide the input dimension. Narrow or
+                # incompatible layers retain FP32 rather than changing shapes.
+                quantizable = child.weight.shape[1] >= 64 and child.weight.shape[1] % 64 == 0
+                replacements[name] = (
+                    INT8Linear(child)
+                    if precision == "int8" and quantizable
+                    else MatmulLinear(child)
+                )
             module.update_modules(replacements)
     mx.eval(dit.parameters())
     dit.eval()

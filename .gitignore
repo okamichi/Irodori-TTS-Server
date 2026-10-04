@@ -1,4 +1,5 @@
 .env
+.env.backup-*
 .venv/
 __pycache__/
 *.py[cod]
@@ -22,4 +23,3 @@ voices/*
 *.safetensors
 *.pt
 *.pth
-

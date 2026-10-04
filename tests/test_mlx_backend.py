@@ -13,23 +13,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def tiny_model(flow="rf_velocity"):
+def tiny_model(flow="rf_velocity", *, model_dim=32):
     from irodori_tts.config import ModelConfig
     from irodori_tts.model import TextToLatentRFDiT
 
     torch.manual_seed(71)
     cfg = ModelConfig(
-        model_dim=32,
+        model_dim=model_dim,
+        mlp_ratio=3.0 if model_dim >= 128 else 2.9,
         num_layers=2,
         num_heads=4,
-        text_dim=16,
+        text_dim=model_dim // 2,
         text_layers=1,
         text_heads=4,
         text_vocab_size=32,
-        speaker_dim=16,
+        speaker_dim=model_dim // 2,
         speaker_layers=1,
         speaker_heads=4,
-        caption_dim=16,
+        caption_dim=model_dim // 2,
         caption_layers=1,
         caption_heads=4,
         caption_vocab_size=32,
@@ -186,11 +187,11 @@ def test_codec_encode_decode_matches_torch():
         np.testing.assert_allclose(np.array(audio), expected_audio.numpy(), rtol=5e-4, atol=4e-5)
 
 
-@pytest.mark.parametrize("precision", ["fp32", "fp16"])
+@pytest.mark.parametrize("precision", ["fp32", "fp16", "int8"])
 def test_compiled_sampler_matches_eager(precision):
     from irodori_openai_tts.mlx_backend import MLXSampler, make_dit
 
-    model = tiny_model()
+    model = tiny_model(model_dim=128 if precision == "int8" else 32)
     dit = make_dit(model, precision=precision)
     args = sample_args()
     with torch.inference_mode():
@@ -199,34 +200,37 @@ def test_compiled_sampler_matches_eager(precision):
     torch.testing.assert_close(actual, expected, rtol=8e-4, atol=8e-5)
 
 
-def test_recompile_uses_updated_precision():
+@pytest.mark.parametrize("precision", ["fp16", "int8"])
+def test_recompile_uses_updated_precision(precision):
     from irodori_openai_tts.mlx_backend import MLXSampler, make_dit, set_dit_precision
 
-    model = tiny_model()
+    model = tiny_model(model_dim=128 if precision == "int8" else 32)
     args = sample_args()
     sampler = MLXSampler(model, make_dit(model), compile_forward=True)
     with torch.inference_mode():
         baseline = sampler.sample(**args)
-        set_dit_precision(sampler.dit, "fp16")
+        set_dit_precision(sampler.dit, precision)
         sampler.recompile()
         actual = sampler.sample(**args)
-        expected = MLXSampler(model, make_dit(model, precision="fp16")).sample(**args)
+        expected = MLXSampler(model, make_dit(model, precision=precision)).sample(**args)
     torch.testing.assert_close(actual, expected, rtol=8e-4, atol=8e-5)
     assert not torch.equal(actual, baseline)
 
 
 @pytest.mark.parametrize("flow", ["rf_velocity", "meanflow"])
 @pytest.mark.parametrize("mode", ["independent", "joint", "alternating"])
-def test_fp16_sampler_preserves_fp32_updates_and_stays_close(flow, mode):
+@pytest.mark.parametrize("precision", ["fp16", "int8"])
+def test_reduced_precision_sampler_preserves_fp32_updates_and_stays_close(flow, mode, precision):
     import mlx.core as mx
 
     from irodori_openai_tts.mlx_backend import MLXSampler, make_dit
 
-    model = tiny_model(flow)
-    dit = make_dit(model, precision="fp16")
+    model = tiny_model(flow, model_dim=128 if precision == "int8" else 32)
+    dit = make_dit(model, precision=precision)
     block = dit.blocks[0]
-    assert block.attention.wq.weight.dtype == mx.float16
-    assert block.mlp.w1.weight.dtype == mx.float16
+    weight_dtype = mx.uint32 if precision == "int8" else mx.float16
+    assert block.attention.wq.weight.dtype == weight_dtype
+    assert block.mlp.w1.weight.dtype == weight_dtype
     assert block.attention.q_norm.weight.dtype == mx.float32
     assert block.attention_adaln.shift_down.weight.dtype == mx.float32
     assert dit.in_proj.weight.dtype == mx.float32
@@ -259,7 +263,52 @@ def test_fp16_sampler_preserves_fp32_updates_and_stays_close(flow, mode):
         actual = sampler.sample(meanflow=flow == "meanflow", **args)
     assert observed_dtypes and all(dtype == mx.float32 for dtype in observed_dtypes)
     assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, expected, rtol=4e-3, atol=2e-3)
+    if precision == "int8":
+        torch.testing.assert_close(actual, expected, rtol=4e-2, atol=1.5e-2)
+    else:
+        torch.testing.assert_close(actual, expected, rtol=4e-3, atol=2e-3)
+
+
+def test_int8_weights_are_packed_and_precision_change_requires_reload():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    from irodori_openai_tts.mlx_backend import make_dit, set_dit_precision
+
+    model = tiny_model(model_dim=128)
+    original = model.blocks[0].attention.wq.weight.detach().clone()
+    baseline = make_dit(model)
+    dit = make_dit(model, precision="int8")
+    layer = dit.blocks[0].attention.wq
+    assert isinstance(layer, nn.QuantizedLinear)
+    assert layer.bits == 8 and layer.group_size == 64
+    assert layer.weight.shape == (128, 32)
+    assert layer.weight.dtype == mx.uint32
+    assert layer.scales.dtype == mx.float16
+    reconstructed = mx.dequantize(layer.weight, layer.scales, layer.biases, group_size=64, bits=8)
+    np.testing.assert_allclose(np.array(reconstructed), original.numpy(), rtol=0.04, atol=0.001)
+    torch.testing.assert_close(model.blocks[0].attention.wq.weight, original)
+
+    def size(module):
+        return sum(value.nbytes for _, value in tree_flatten(module.parameters()))
+
+    assert size(dit) < size(baseline) * 0.5
+    with pytest.raises(ValueError, match="Reload the checkpoint"):
+        set_dit_precision(dit, "fp16")
+    assert layer.weight.dtype == mx.uint32
+
+
+def test_int8_preserves_narrow_layers_in_fp32():
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from irodori_openai_tts.mlx_backend import make_dit
+
+    dit = make_dit(tiny_model(), precision="int8")
+    assert dit.blocks[0].attention.wq.weight.dtype == mx.float32
+    assert isinstance(dit.blocks[0].mlp.w2, nn.Linear)
+    assert dit.blocks[0].mlp.w2.weight.dtype == mx.float32
 
 
 def test_fp16_gemm_upcasts_before_residual_and_norm():

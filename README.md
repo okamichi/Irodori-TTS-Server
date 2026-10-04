@@ -88,13 +88,39 @@ request for a new shape may incur compilation overhead.
 Use an unquantized checkpoint with deterministic codec encode/decode.
 Dynamic LoRA is unsupported in this backend; use a merged checkpoint or
 `IRODORI_INFERENCE_BACKEND=torch`. Keep `IRODORI_MODEL_PRECISION=fp32` and
-`IRODORI_CODEC_PRECISION=fp32` on MPS: the upstream loader rejects `bf16` on MPS.
+`IRODORI_CODEC_PRECISION=fp32` for the hybrid MLX path on MPS.
+The upstream loader rejects `bf16` on MPS; this server additionally supports
+experimental MPS BF16 loading after testing a small BF16 operation on the device.
+For the published `int8-weight-only` torchao checkpoint, set backend `torch`,
+model precision `bf16`, model device `mps`, and keep the codec in `fp32`.
+Other quantization variants may require unavailable CUDA kernels; this does
+not imply all torchao variants work on MPS. No installed upstream files are patched.
 `IRODORI_MLX_DIT_PRECISION=fp16` independently reduces the large attention/MLP
 weights and matrix multiplications to FP16. AdaLN, normalization, timestep
 conditioning, residuals, attention, CFG and Euler updates stay FP32, as do the
 PyTorch encoders, duration predictor and codec. The default is `fp32`; set it
 explicitly to return to the original full-precision MLX path on restart.
 FP16 introduces rounding differences; compare saved audio for your voices.
+To quantize the DiT in memory at startup, use:
+
+```bash
+IRODORI_MLX_DIT_PRECISION=int8
+```
+
+This uses MLX affine 8bit weight-only quantization (group size 64) for the
+large attention/MLP Linear layers, with FP16 activations and scale/offset
+tables. Outputs return to FP32 for attention, residuals, CFG and Euler updates.
+AdaLN, normalization, timestep conditioning and small input/output projectors
+remain FP32. Narrow layers or input dimensions not divisible by 64 retain FP32.
+The PyTorch encoders, duration predictor and codec keep their existing precision.
+Use the original unquantized checkpoint; no pre-conversion or quantized-model downloads
+are needed, and the original files are unchanged. Published torchao/CUDA
+quantized checkpoints are not inputs to this MLX conversion.
+Conversion runs after the usual model load (on the first request, or during
+startup with `IRODORI_PRELOAD=true`), so loading/conversion still requires memory
+for the original weights. Restart to switch between `fp32`, `fp16` and `int8`.
+INT8 reduces weight storage but is not guaranteed to outperform FP16; compare
+speed and saved audio for your workload before choosing it.
 The codec preserves the upstream
 padding, disabled DACVAE watermark branch and separate SilentCipher processing.
 The checkpoint and codec are initially loaded through the existing loader, so
@@ -140,9 +166,11 @@ duration prediction and speaker-state reuse. MLX speedups depend on workload;
 chunk streaming reduces time until playback begins only when the client plays
 chunks incrementally.
 
-Add `--compare-mlx-precisions` to measure FP32 and mixed FP16 MLX sequentially
-with the same loaded checkpoint, or `--mlx-precision fp16` for FP16 alone.
-The comparison saves both WAV outputs, timing, DiT weight sizes and numerical
+Add `--compare-mlx-precisions` to measure FP32, mixed FP16 and INT8 MLX sequentially
+with the same loaded checkpoint, or `--mlx-precision int8` for INT8 alone.
+FP16 remains available with `--mlx-precision fp16`. The comparison quantizes
+from the original FP32 weights rather than already-rounded FP16 weights.
+The comparison saves all precision variants' WAV outputs, timing, DiT weight sizes and numerical
 audio differences; numerical similarity does not establish perceived quality.
 
 `IRODORI_HF_CHECKPOINT` also accepts a checkpoint subfolder inside a Hugging Face repo:
@@ -658,7 +686,7 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_CODEC_REPO` | `Aratako/Semantic-DACVAE-Japanese-32dim` | DACVAE codec repo or path. |
 | `IRODORI_MODEL_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
 | `IRODORI_INFERENCE_BACKEND` | `torch` | `torch` or hybrid `mlx` (Apple Silicon). |
-| `IRODORI_MLX_DIT_PRECISION` | `fp32` | MLX only: `fp32` or mixed `fp16` attention/MLP matrix multiplications with FP32 norms/CFG/Euler updates. |
+| `IRODORI_MLX_DIT_PRECISION` | `fp32` | MLX only: `fp32`, mixed `fp16`, or `int8` weight-only attention/MLP quantization in memory. Norms/CFG/Euler updates stay FP32. |
 | `IRODORI_REFERENCE_CACHE_ENTRIES` | `8` | Shared limit for cached reference latent/speaker-state entries; `0` disables. |
 | `IRODORI_REFERENCE_CACHE_MAX_MB` | `256` | Shared CPU-memory cache budget in MiB; `0` disables. |
 | `IRODORI_STREAM_PREFETCH_CHUNKS` | `1` | Buffered SSE events (`0`–`4`); an additional synthesis can be in flight. |

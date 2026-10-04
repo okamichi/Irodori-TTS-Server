@@ -4,12 +4,16 @@ import logging
 import threading
 import time
 from pathlib import Path
+from types import FunctionType
+
+import torch
 
 from irodori_tts.inference_runtime import (
     InferenceRuntime,
     RuntimeKey,
     default_runtime_device,
     download_hf_checkpoint,
+    resolve_runtime_dtype,
 )
 
 from .config import Settings
@@ -19,6 +23,48 @@ logger = logging.getLogger(__name__)
 
 class RuntimeLoadTimeoutError(RuntimeError):
     pass
+
+
+def _probe_mps_bf16() -> None:
+    """Fail before loading a large checkpoint if this MPS build lacks BF16."""
+    try:
+        value = torch.ones((2, 2), device="mps", dtype=torch.bfloat16)
+        result = value @ value
+        torch.mps.synchronize()
+        if not bool(torch.isfinite(result).all()):
+            raise RuntimeError("BF16 probe returned non-finite values")
+    except (RuntimeError, TypeError) as exc:
+        raise RuntimeError("This PyTorch/macOS environment cannot run BF16 on MPS.") from exc
+
+
+def _load_runtime(key: RuntimeKey) -> InferenceRuntime:
+    mps_bf16 = any(
+        str(device).strip().lower() == "mps" and str(precision).strip().lower() == "bf16"
+        for device, precision in (
+            (key.model_device, key.model_precision),
+            (key.codec_device, key.codec_precision),
+        )
+    )
+    if not mps_bf16:
+        return InferenceRuntime.from_key(key)
+    _probe_mps_bf16()
+    logger.warning("Using experimental MPS BF16 inference after a successful device probe")
+
+    def dtype_resolver(*, precision, device):
+        if str(precision).strip().lower() == "bf16" and device.type == "mps":
+            return torch.bfloat16
+        return resolve_runtime_dtype(precision=precision, device=device)
+
+    # Relax only this loader's dtype guard. Do not modify site-packages or the
+    # process-wide upstream resolver used by other runtimes.
+    original = InferenceRuntime.from_key.__func__
+    namespace = dict(original.__globals__)
+    namespace["resolve_runtime_dtype"] = dtype_resolver
+    loader = FunctionType(
+        original.__code__, namespace, original.__name__, original.__defaults__, original.__closure__
+    )
+    loader.__kwdefaults__ = original.__kwdefaults__
+    return loader(InferenceRuntime, key)
 
 
 class RuntimeManager:
@@ -45,7 +91,7 @@ class RuntimeManager:
                 t0 = time.perf_counter()
                 self._checkpoint_path = self._resolve_checkpoint_path()
                 logger.info("checkpoint resolved: %s", self._checkpoint_path)
-                runtime = InferenceRuntime.from_key(
+                runtime = _load_runtime(
                     RuntimeKey(
                         checkpoint=self._checkpoint_path,
                         model_device=self._resolve_device(self.settings.model_device),
